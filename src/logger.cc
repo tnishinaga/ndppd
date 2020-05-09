@@ -18,6 +18,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <cstring>
+#include <cerrno>
 #include <iostream>
 #include <sstream>
 
@@ -77,6 +78,19 @@ std::string logger::format(const std::string& fmt, ...)
     vsnprintf(buf, sizeof(buf), fmt.c_str(), va);
     va_end(va);
     return buf;
+}
+
+std::string logger::err()
+{
+    char buf[2048];
+
+#if (_POSIX_C_SOURCE >= 200112L || _XOPEN_SOURCE >= 600) && ! _GNU_SOURCE
+    if (strerror_r(errno, buf, sizeof(buf))
+        return "Unknown error";
+    return buf;
+#else
+    return strerror_r(errno, buf, sizeof(buf));
+#endif
 }
 
 logger logger::error()

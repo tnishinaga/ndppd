@@ -18,6 +18,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <list>
 
 #include <sys/poll.h>
 
@@ -36,24 +37,57 @@ public:
 
     const address& addr() const;
 
-    ptr<iface> ifa() const;
+    ptr<iface> daughter() const;
 
     bool is_auto() const;
 
     bool check(const address& addr) const;
+
+    static bool any_auto();
+    
+    static bool any_static();
+    
+    static bool any_iface();
+    
+    bool autovia() const;
+
+    void autovia(bool val);
 
 private:
     weak_ptr<rule> _ptr;
 
     weak_ptr<proxy> _pr;
 
-    ptr<iface> _ifa;
+    ptr<iface> _daughter;
 
     address _addr;
 
     bool _aut;
 
+    static bool _any_aut;
+    
+    static bool _any_static;
+    
+    static bool _any_iface;
+    
+    bool _autovia;
+
     rule();
 };
+
+class interface {
+public:
+    // List of IPv6 addresses on this interface
+    std::list<address> addresses;
+
+    // Index of this interface
+    int ifindex;
+
+    // Name of this interface.
+    std::string _name;
+
+};
+
+extern std::vector<interface> interfaces;
 
 NDPPD_NS_END

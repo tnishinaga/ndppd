@@ -24,6 +24,7 @@
 #include <getopt.h>
 #include <sys/time.h>
 
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -32,20 +33,29 @@
 
 using namespace ndppd;
 
-int daemonize()
+static int daemonize()
 {
     pid_t pid = fork();
-
-    if (pid < 0)
+    if (pid < 0) {
+        logger::error() << "Failed to fork during daemonize: " << logger::err();
         return -1;
+    }
 
     if (pid > 0)
         exit(0);
 
-    pid_t sid = setsid();
+    umask(0);
 
-    if (sid < 0)
+    pid_t sid = setsid();
+    if (sid < 0) {
+        logger::error() << "Failed to setsid during daemonize: " << logger::err();
         return -1;
+    }
+
+    if (chdir("/") < 0) {
+        logger::error() << "Failed to change path during daemonize: " << logger::err();
+        return -1;
+    }
 
     close(STDIN_FILENO);
     close(STDOUT_FILENO);
@@ -54,17 +64,12 @@ int daemonize()
     return 0;
 }
 
-bool configure(const std::string& path)
+static ptr<conf> load_config(const std::string& path)
 {
     ptr<conf> cf, x_cf;
 
     if (!(cf = conf::load(path)))
-        return false;
-
-    if (!(x_cf = cf->find("route-ttl")))
-        route::ttl(30000);
-    else
-        route::ttl(*x_cf);
+        return (conf*)NULL;
 
     std::vector<ptr<conf> >::const_iterator p_it;
 
@@ -75,13 +80,94 @@ bool configure(const std::string& path)
 
         if (pr_cf->empty()) {
             logger::error() << "'proxy' section is missing interface name";
-            return false;
+            return (conf*)NULL;
         }
 
-        ptr<proxy> pr = proxy::open(*pr_cf);
+        std::vector<ptr<conf> >::const_iterator r_it;
 
-        if (!pr) {
-            logger::error() << "Configuration failed for proxy '" << (const std::string& )*pr_cf << "'";
+        std::vector<ptr<conf> > rules(pr_cf->find_all("rule"));
+
+        for (r_it = rules.begin(); r_it != rules.end(); r_it++) {
+            ptr<conf> ru_cf =* r_it;
+
+            if (ru_cf->empty()) {
+                logger::error() << "'rule' is missing an IPv6 address/net";
+                return (conf*)NULL;
+            }
+
+            address addr(*ru_cf);
+
+            if (x_cf = ru_cf->find("iface")) {
+                if (ru_cf->find("static") || ru_cf->find("auto")) {
+                    logger::error()
+                        << "Only one of 'iface', 'auto' and 'static' may "
+                        << "be specified.";
+                    return (conf*)NULL;
+                }
+                if ((const std::string&)*x_cf == "") {
+                    logger::error() << "'iface' expected an interface name";
+                    return (conf*)NULL;
+                }
+            } else if (ru_cf->find("static")) {
+                if (ru_cf->find("auto")) {
+                    logger::error()
+                        << "Only one of 'iface', 'auto' and 'static' may "
+                        << "be specified.";
+                    return (conf*)NULL;
+                }
+                if (addr.prefix() <= 120) {
+                    logger::warning()
+                        << "Low prefix length (" << addr.prefix()
+                        << " <= 120) when using 'static' method";
+                }
+            } else if (!ru_cf->find("auto")) {
+                logger::error()
+                    << "You must specify either 'iface', 'auto' or "
+                    << "'static'";
+                return (conf*)NULL;
+
+            }
+        }
+    }
+
+    return cf;
+}
+
+static bool configure(ptr<conf>& cf)
+{
+    ptr<conf> x_cf;
+
+    if (!(x_cf = cf->find("route-ttl")))
+        route::ttl(30000);
+    else
+        route::ttl(*x_cf);
+    
+    if (!(x_cf = cf->find("address-ttl")))
+        address::ttl(30000);
+    else
+        address::ttl(*x_cf);
+    
+    std::list<ptr<rule> > myrules;
+
+    std::vector<ptr<conf> >::const_iterator p_it;
+
+    std::vector<ptr<conf> > proxies(cf->find_all("proxy"));
+
+    for (p_it = proxies.begin(); p_it != proxies.end(); p_it++) {
+        ptr<conf> pr_cf = *p_it;
+
+        if (pr_cf->empty()) {
+            return false;
+        }
+        
+        bool promiscuous = false;
+        if (!(x_cf = pr_cf->find("promiscuous")))
+            promiscuous = false;
+        else
+            promiscuous = *x_cf;
+
+        ptr<proxy> pr = proxy::open(*pr_cf, promiscuous);
+        if (!pr || pr.is_null() == true) {
             return false;
         }
 
@@ -89,11 +175,31 @@ bool configure(const std::string& path)
             pr->router(true);
         else
             pr->router(*x_cf);
+        
+        if (!(x_cf = pr_cf->find("autowire")))
+            pr->autowire(false);
+        else
+            pr->autowire(*x_cf);
+        
+        if (!(x_cf = pr_cf->find("keepalive")))
+            pr->keepalive(true);
+        else
+            pr->keepalive(*x_cf);
+        
+        if (!(x_cf = pr_cf->find("retries")))
+            pr->retries(3);
+        else
+            pr->retries(*x_cf);
 
         if (!(x_cf = pr_cf->find("ttl")))
             pr->ttl(30000);
         else
             pr->ttl(*x_cf);
+        
+        if (!(x_cf = pr_cf->find("deadtime")))
+            pr->deadtime(pr->ttl());
+        else
+            pr->deadtime(*x_cf);
 
         if (!(x_cf = pr_cf->find("timeout")))
             pr->timeout(500);
@@ -107,44 +213,78 @@ bool configure(const std::string& path)
         for (r_it = rules.begin(); r_it != rules.end(); r_it++) {
             ptr<conf> ru_cf =* r_it;
 
-            if (ru_cf->empty()) {
-                logger::error() << "'rule' is missing an IPv6 address/net";
-                return false;
-            }
-
             address addr(*ru_cf);
+            
+            bool autovia = false;
+            if (!(x_cf = ru_cf->find("autovia")))
+                autovia = false;
+            else
+                autovia = *x_cf;
 
-            if (x_cf = ru_cf->find("iface")) {
-                if ((const std::string& )*x_cf == "") {
-                    logger::error() << "'iface' expected an interface name";
-                } else {
-                    pr->add_rule(addr, iface::open_ifd(*x_cf));
+            if (x_cf = ru_cf->find("iface"))
+            {
+                ptr<iface> ifa = iface::open_ifd(*x_cf);
+                if (!ifa || ifa.is_null() == true) {
+                    return false;
                 }
+                
+                ifa->add_parent(pr);
+                
+                myrules.push_back(pr->add_rule(addr, ifa, autovia));
             } else if (ru_cf->find("auto")) {
-                pr->add_rule(addr, true);
+                myrules.push_back(pr->add_rule(addr, true));
             } else {
-                if (!ru_cf->find("static")) {
-                    logger::warning()
-                        << "## I'm going for 'static' since you didn't specify any method. Please fix this" << logger::endl
-                        << "## as it's not going to be supported in future versions of ndppd. (See 'man ndppd.conf')";
-                }
-
-                if (addr.prefix() <= 120) {
-                    logger::warning()
-                        << "Low prefix length (" << addr.prefix() << " <= 120) when using 'static' method";
-                }
-
-                pr->add_rule(addr, false);
+                myrules.push_back(pr->add_rule(addr, false));
             }
         }
     }
-
+    
+    // Print out all the topology    
+    for (std::map<std::string, weak_ptr<iface> >::iterator i_it = iface::_map.begin(); i_it != iface::_map.end(); i_it++) {
+        ptr<iface> ifa = i_it->second;
+        
+        logger::debug() << "iface " << ifa->name() << " {";
+        
+        for (std::list<weak_ptr<proxy> >::iterator pit = ifa->serves_begin(); pit != ifa->serves_end(); pit++) {
+            ptr<proxy> pr = (*pit);
+            if (!pr) continue;
+            
+            logger::debug() << "  " << "proxy " << logger::format("%x", pr.get_pointer()) << " {";
+            
+             for (std::list<ptr<rule> >::iterator rit = pr->rules_begin(); rit != pr->rules_end(); rit++) {
+                ptr<rule> ru = *rit;
+                
+                logger::debug() << "    " << "rule " << logger::format("%x", ru.get_pointer()) << " {";
+                logger::debug() << "      " << "taddr " << ru->addr()<< ";";
+                if (ru->is_auto())
+                    logger::debug() << "      " << "auto;";
+                else if (!ru->daughter())
+                    logger::debug() << "      " << "static;";
+                else
+                    logger::debug() << "      " << "iface " << ru->daughter()->name() << ";";
+                logger::debug() << "    }";
+             }
+            
+            logger::debug() << "  }";
+        }
+        
+        logger::debug() << "  " << "parents {";
+        for (std::list<weak_ptr<proxy> >::iterator pit = ifa->parents_begin(); pit != ifa->parents_end(); pit++) {
+            ptr<proxy> pr = (*pit);
+            
+            logger::debug() << "    " << "parent " << logger::format("%x", pr.get_pointer()) << ";";
+        }
+        logger::debug() << "  }";
+        
+        logger::debug() << "}";
+    }
+    
     return true;
 }
 
-bool running = true;
+static bool running = true;
 
-void exit_ndppd(int sig)
+static void exit_ndppd(int sig)
 {
     logger::error() << "Shutting down...";
     running = 0;
@@ -201,14 +341,25 @@ int main(int argc, char* argv[], char* env[])
         }
     }
 
+    logger::notice()
+        << "ndppd (NDP Proxy Daemon) version " NDPPD_VERSION << logger::endl
+        << "Using configuration file '" << config_path << "'";
+
+    // Load configuration.
+
+    ptr<conf> cf = load_config(config_path);
+    if (cf.is_null())
+        return -1;
+
     if (daemon) {
         logger::syslog(true);
 
-        if (daemonize() < 0) {
-            logger::error() << "Failed to daemonize process";
+        if (daemonize() < 0)
             return 1;
-        }
     }
+
+    if (!configure(cf))
+        return -1;
 
     if (!pidfile.empty()) {
         std::ofstream pf;
@@ -217,22 +368,15 @@ int main(int argc, char* argv[], char* env[])
         pf.close();
     }
 
-    logger::notice()
-        << "ndppd (NDP Proxy Daemon) version " NDPPD_VERSION << logger::endl
-        << "Using configuration file '" << config_path << "'";
-
-    // Load configuration.
-
-    if (!configure(config_path))
-        return -1;
-
-    //route::load("/proc/net/ipv6_route");
-
     // Time stuff.
 
     struct timeval t1, t2;
 
     gettimeofday(&t1, 0);
+
+#ifdef WITH_ND_NETLINK
+    netlink_setup();
+#endif
 
     while (running) {
         if (iface::poll_all() < 0) {
@@ -252,9 +396,18 @@ int main(int argc, char* argv[], char* env[])
         t1.tv_sec  = t2.tv_sec;
         t1.tv_usec = t2.tv_usec;
 
-        route::update(elapsed_time);
+        if (rule::any_auto())
+            route::update(elapsed_time);
+        
+        if (rule::any_iface())
+            address::update(elapsed_time);
+
         session::update_all(elapsed_time);
     }
+
+#ifdef WITH_ND_NETLINK
+    netlink_teardown();
+#endif
 
     logger::notice() << "Bye";
 

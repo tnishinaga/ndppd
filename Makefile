@@ -9,11 +9,17 @@ CXX     ?= g++
 GZIP    ?= /bin/gzip
 MANDIR  ?= ${DESTDIR}${PREFIX}/share/man
 SBINDIR ?= ${DESTDIR}${PREFIX}/sbin
+PKG_CONFIG ?= pkg-config
 
-LIBS     =
 
 OBJS     = src/logger.o src/ndppd.o src/iface.o src/proxy.o src/address.o \
-           src/rule.o src/session.o src/conf.o src/route.o
+           src/rule.o src/session.o src/conf.o src/route.o 
+
+ifdef WITH_ND_NETLINK
+  LIBS     = `${PKG_CONFIG} --libs glib-2.0 libnl-3.0 libnl-route-3.0` -pthread
+  CPPFLAGS = `${PKG_CONFIG} --cflags glib-2.0 libnl-3.0 libnl-route-3.0`
+  OBJ      = ${OBJ} src/nd-netlink.o
+endif
 
 all: ndppd ndppd.1.gz ndppd.conf.5.gz
 
@@ -31,10 +37,13 @@ ndppd.conf.5.gz:
 	${GZIP} < ndppd.conf.5 > ndppd.conf.5.gz
 
 ndppd: ${OBJS}
-	${CXX} -o ndppd ${LDFLAGS} ${LIBS} ${OBJS}
+	${CXX} -o ndppd ${LDFLAGS} ${OBJS} ${LIBS}
+
+nd-proxy: nd-proxy.c
+	${CXX} -o nd-proxy -Wall -Werror ${LDFLAGS} `${PKG_CONFIG} --cflags glib-2.0` nd-proxy.c `${PKG_CONFIG} --libs glib-2.0`
 
 .cc.o:
-	${CXX} -c $(CXXFLAGS) -o $@ $<
+	${CXX} -c ${CPPFLAGS} $(CXXFLAGS) -o $@ $<
 
 clean:
-	rm -f ndppd ndppd.conf.5.gz ndppd.1.gz ${OBJS}
+	rm -f ndppd ndppd.conf.5.gz ndppd.1.gz ${OBJS} nd-proxy
