@@ -1,3 +1,9 @@
+ndppd (0.2.6-1) unstable; urgency=low
+
+  * New release (0.2.6).
+
+ -- Toshifumi Nishinaga <tnishinaga.dev@gmail.com>  Sat, 09 May 2020 17:35:48 +0900
+
 ndppd (0.2.3-1) unstable; urgency=low
 
   * New release (0.2.3).
